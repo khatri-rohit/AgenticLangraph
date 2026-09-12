@@ -1,7 +1,7 @@
 import { ChatOllama } from '@langchain/ollama';
 
 const model = new ChatOllama({
-    model: 'glm:5.2-cloud',
+    model: 'glm-5.2:cloud',
     baseUrl: 'https://ollama.com',
     temperature: 0.7,
     headers: {
