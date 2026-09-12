@@ -1,30 +1,15 @@
-import model from '@/lib/model';
-import {
-    StateGraph,
-    StateSchema,
-    START,
-    END,
-    MessagesValue,
-    GraphNode,
-} from '@langchain/langgraph';
+import { NextRequest, NextResponse } from 'next/server';
+import { AIMessage } from '@langchain/core/messages';
+import { graph } from '@/graph/chatpipline';
 
-const State = new StateSchema({
-    messages: MessagesValue,
-});
+async function handler(req: NextRequest) {
+    const { messages } = await req.json();
+    console.log('messages', messages);
+    const response = await graph.invoke({
+        messages: [new AIMessage({ content: messages })],
+    });
+    console.log('response', response);
+    return NextResponse.json(response);
+}
 
-const chatbot: GraphNode<typeof State> = async (state) => {
-    const response = await model.invoke(state.messages);
-    return {
-        messages: [
-            ...state.messages,
-            { role: 'ai', content: response.content },
-        ],
-    };
-};
-
-const graph = new StateGraph(State)
-    .addNode('chatbot', chatbot)
-    .addEdge(START, 'chatbot')
-    .addEdge('chatbot', END);
-
-graph.compile();
+export { handler as GET, handler as POST };
