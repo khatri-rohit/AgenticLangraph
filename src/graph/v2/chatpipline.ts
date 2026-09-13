@@ -5,13 +5,24 @@ import {
     GraphNode,
     StateSchema,
     MessagesValue,
+    interrupt,
+    getConfig,
 } from '@langchain/langgraph';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { tool } from '@langchain/core/tools';
-import { AIMessage } from '@langchain/core/messages';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import type {
+    ToolApprovalDecision,
+    ToolApprovalInterruptPayload,
+    HitlConfigurable,
+} from '@/lib/hitl';
+import {
+    TOOL_DENIAL_PREFIX,
+    isToolDenialContent,
+} from '@/lib/hitl';
 import z from 'zod';
 import { ChatOllama } from '@langchain/ollama';
-import { MemorySaver, InMemoryStore } from '@langchain/langgraph';
+import { MemorySaver } from '@langchain/langgraph';
 
 import { Firecrawl } from 'firecrawl';
 
@@ -23,8 +34,12 @@ const firecrawl = new Firecrawl({
     apiKey: process.env.FIRECRAWL_API_KEY ?? '',
 });
 
+/**
+ * In-process checkpoint store — required for `interrupt()` + `Command({ resume })`.
+ * Replace with Postgres/SQLite checkpointer before multi-instance or serverless deploy.
+ * @see https://docs.langchain.com/oss/javascript/langgraph/checkpointers
+ */
 const checkpointer = new MemorySaver();
-const store = new InMemoryStore();
 
 export type WebSearchHit = {
     title: string;
@@ -50,19 +65,6 @@ export type FetchUrlOutput = {
     pages: FetchedPage[];
     error?: string;
 };
-
-// const AnnotationWithReducer = Annotation.Root({
-//     messages: Annotation<BaseMessage[]>({
-//         // Different types are allowed for updates
-//         reducer: (left: BaseMessage[], right: BaseMessage | BaseMessage[]) => {
-//             if (Array.isArray(right)) {
-//                 return left.concat(right);
-//             }
-//             return left.concat([right]);
-//         },
-//         default: () => [],
-//     }),
-// });
 
 export async function firecrawlSearch(
     query: string,
@@ -196,9 +198,7 @@ const getWeatherForLocation = async (latitude: number, longitude: number) => {
 // Tools
 const searchTool = tool(
     async ({ query }: { query: string }) => {
-        const results = await firecrawlSearch(query);
-        console.log('searchTool results', results);
-        return results;
+        return await firecrawlSearch(query);
     },
     {
         name: 'firecrawl_search',
@@ -239,22 +239,21 @@ const getWeather = tool(
     },
 );
 
-const approveGate = tool(
-    async ({ approve }: { approve: boolean }) => {
-        return {
-            approve,
-        };
-    },
-    {
-        name: 'approve_gate',
-        description: 'Use this tool to approve or reject the next tool call',
-        schema: z.object({
-            approve: z
-                .boolean()
-                .describe('Whether to approve the next tool call'),
-        }),
-    },
-);
+/** All tools available to the agent (human approval is NOT an LLM tool). */
+const ALL_AGENT_TOOLS = [searchTool, getWeather];
+
+function readHitlConfig(): HitlConfigurable {
+    const configurable = (getConfig().configurable ?? {}) as HitlConfigurable;
+    return configurable;
+}
+
+function toolsForRun(config: HitlConfigurable) {
+    const enabled = config.enabled_tools;
+    if (!enabled?.length) {
+        return ALL_AGENT_TOOLS;
+    }
+    return ALL_AGENT_TOOLS.filter((t) => enabled.includes(t.name));
+}
 
 // State schema for the chatbot
 const State = new StateSchema({
@@ -271,8 +270,11 @@ const model = new ChatOllama({
 });
 
 const chatbot: GraphNode<typeof State> = async (state) => {
+    const hitl = readHitlConfig();
+    const boundTools = toolsForRun(hitl);
+
     const response = await model
-        .bindTools([searchTool, getWeather, approveGate])
+        .bindTools(boundTools)
         .invoke(state.messages, { outputVersion: 'v1' });
 
     // Append the model message as-is so tool_calls survive for ToolNode routing.
@@ -282,21 +284,98 @@ const chatbot: GraphNode<typeof State> = async (state) => {
 function routeAfterChatbot(state: typeof State.State) {
     const last = state.messages.at(-1);
     if (AIMessage.isInstance(last) && (last.tool_calls?.length ?? 0) > 0) {
-        return 'tool_call';
+        return 'human_approval';
     }
     return END;
 }
 
-const toolNode = new ToolNode([searchTool, getWeather, approveGate]);
+/**
+ * Pauses the run for human approve/deny when policy requires it.
+ * Resume with Command({ resume: ToolApprovalDecision }) from the API.
+ */
+const humanApproval: GraphNode<typeof State> = async (state) => {
+    const hitl = readHitlConfig();
+    const last = state.messages.at(-1);
+    if (!AIMessage.isInstance(last) || !last.tool_calls?.length) {
+        return {};
+    }
 
+    const toolCalls = last.tool_calls;
+    const autoApprove = new Set(hitl.auto_approve_tools ?? []);
+    const needsInterrupt =
+        hitl.require_tool_approval === true &&
+        toolCalls.some((tc) => !autoApprove.has(tc.name));
+
+    // Auto-run: no interrupt; routing continues to tool_call.
+    if (!needsInterrupt) {
+        return {};
+    }
+
+    // First visit: interrupt with pending tool metadata for the UI.
+    // Second visit (after Command resume): `decision` is the user's choice.
+    const decision = interrupt<
+        ToolApprovalInterruptPayload,
+        ToolApprovalDecision
+    >({
+        kind: 'tool_approval',
+        toolCalls: toolCalls.map((tc) => ({
+            id: tc.id,
+            name: tc.name,
+            args: tc.args as Record<string, unknown>,
+        })),
+    });
+
+    if (decision.action === 'deny') {
+        const reason =
+            decision.reason?.trim() || 'User denied tool execution.';
+        const denialMessages = toolCalls.map(
+            (tc) =>
+                new ToolMessage({
+                    content: `${TOOL_DENIAL_PREFIX} ${reason}`,
+                    tool_call_id: tc.id ?? '',
+                    name: tc.name,
+                }),
+        );
+        return { messages: denialMessages };
+    }
+
+    // Approved: proceed to ToolNode with unchanged AI tool_calls in state.
+    return {};
+};
+
+function routeAfterHumanApproval(state: typeof State.State) {
+    const last = state.messages.at(-1);
+    if (ToolMessage.isInstance(last) && isToolDenialContent(last.content)) {
+        return 'chatbot';
+    }
+    return 'tool_call';
+}
+
+const toolNode = new ToolNode(ALL_AGENT_TOOLS);
+
+/**
+ * Graph flow (human-in-the-loop):
+ *   START → chatbot → (tool calls?) → human_approval → tool_call → chatbot → END
+ *
+ * - `human_approval` calls interrupt() when require_tool_approval is true and the
+ *   tool is not listed in auto_approve_tools (from config.configurable).
+ * - Resume with Command({ resume: { action: 'approve' | 'deny' } }) via POST /api/chat/v2.
+ * - Deny injects ToolMessages so the model can respond without running ToolNode.
+ */
 export const graph = new StateGraph(State)
     .addNode('chatbot', chatbot)
-    .addNode('approve_gate', approveGate)
+    .addNode('human_approval', humanApproval)
     .addNode('tool_call', toolNode)
     .addEdge(START, 'chatbot')
-    .addConditionalEdges('chatbot', routeAfterChatbot, ['tool_call', END])
+    .addConditionalEdges('chatbot', routeAfterChatbot, [
+        'human_approval',
+        END,
+    ])
+    .addConditionalEdges('human_approval', routeAfterHumanApproval, [
+        'tool_call',
+        'chatbot',
+    ])
     .addEdge('tool_call', 'chatbot')
-    .addEdge('approve_gate', 'tool_call')
-    .compile({ checkpointer, store, interruptBefore: ['tool_call'] });
+    .compile({ checkpointer });
 
 export type ChatPipeline = typeof graph;
