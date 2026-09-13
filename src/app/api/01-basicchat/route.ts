@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { AIMessage } from '@langchain/core/messages';
-import { graph } from '@/graph/chatpipline';
+import { graph } from '@/graph/v1/chatpipline';
 
 async function handler(req: NextRequest) {
     const { messages } = await req.json();

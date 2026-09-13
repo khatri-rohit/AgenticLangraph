@@ -5,10 +5,7 @@ import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport, type UIMessage } from 'ai';
 import { Markdown } from './Markdown';
 
-function renderMessagePart(
-    part: UIMessage['parts'][number],
-    key: string,
-) {
+function renderMessagePart(part: UIMessage['parts'][number], key: string) {
     if (part.type === 'text') {
         return part.text.trim() ? (
             <Markdown key={key}>{part.text}</Markdown>
@@ -76,7 +73,7 @@ export function PipelineChat() {
     const { messages, sendMessage, status } = useChat({
         id: 'pipeline-chat',
         transport: new DefaultChatTransport({
-            api: '/api/chat',
+            api: '/api/chat/v1',
             prepareSendMessagesRequest: ({ id, messages }) => ({
                 body: { messages, threadId: id },
             }),
@@ -123,10 +120,7 @@ export function PipelineChat() {
                                 {message.role}
                             </span>
                             {message.parts.map((part, i) =>
-                                renderMessagePart(
-                                    part,
-                                    `${message.id}-${i}`,
-                                ),
+                                renderMessagePart(part, `${message.id}-${i}`),
                             )}
                         </div>
                     ))}
