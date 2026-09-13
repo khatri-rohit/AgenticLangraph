@@ -3,6 +3,6 @@
     "dockerfile": false,
     "env": ".env",
     "graphs": {
-        "chatpipline": "./src/graph/chatpipline.ts:graph"
+        "chatpipline": "./src/graph/v2/chatpipline.ts:graph"
     }
 }

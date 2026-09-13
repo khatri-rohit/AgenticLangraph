@@ -65,17 +65,31 @@ function renderMessagePart(part: UIMessage['parts'][number], key: string) {
         );
     }
 
+    if (part.type === 'custom') {
+    }
+
     return null;
 }
 
 export function PipelineChat() {
     const [input, setInput] = useState('');
+
+    const [hitlEnabled, setHitlEnabled] = useState(true);
+
     const { messages, sendMessage, status } = useChat({
         id: 'pipeline-chat',
         transport: new DefaultChatTransport({
             api: '/api/chat/v1',
             prepareSendMessagesRequest: ({ id, messages }) => ({
-                body: { messages, threadId: id },
+                body: {
+                    messages,
+                    threadId: id,
+                    requireToolApproval: hitlEnabled,
+                    enabledTools: ['get_weather', 'firecrawl_search'],
+                    autoApproveTools: hitlEnabled
+                        ? []
+                        : ['get_weather', 'firecrawl_search'],
+                },
             }),
         }),
     });
@@ -141,6 +155,13 @@ export function PipelineChat() {
                     className="rounded-lg bg-blue-500 px-5 py-2 font-medium text-white transition-colors hover:bg-blue-600 disabled:opacity-50"
                 >
                     {isBusy ? 'Running…' : 'Send'}
+                </button>
+                <button
+                    type="button"
+                    onClick={() => setHitlEnabled((prev) => !prev)}
+                    className="rounded-lg bg-blue-500 px-5 py-2 font-medium text-white transition-colors hover:bg-blue-600 disabled:opacity-50"
+                >
+                    {hitlEnabled ? 'Disable HITL' : 'Enable HITL'}
                 </button>
             </form>
         </div>

@@ -107,22 +107,7 @@ export async function firecrawlSearch(
     }
 }
 
-export const searchTool = tool(
-    async ({ query }: { query: string }) => {
-        const results = await firecrawlSearch(query);
-        console.log('searchTool results', results);
-        return results;
-    },
-    {
-        name: 'firecrawl_search',
-        description:
-            'You must use this tool to search the web for information which u dont have and talk with real facts rather than hallucinating',
-        schema: z.object({
-            query: z.string().describe('The query to search for'),
-        }),
-    },
-);
-
+// Helper functions
 function normalizeHit(item: unknown): WebSearchHit | null {
     if (!item || typeof item !== 'object') return null;
 
@@ -200,6 +185,31 @@ async function geocodeCity(
     }
 }
 
+const getWeatherForLocation = async (latitude: number, longitude: number) => {
+    const response = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true`,
+    );
+    const data = await response.json();
+    return data;
+};
+
+// Tools
+const searchTool = tool(
+    async ({ query }: { query: string }) => {
+        const results = await firecrawlSearch(query);
+        console.log('searchTool results', results);
+        return results;
+    },
+    {
+        name: 'firecrawl_search',
+        description:
+            'You must use this tool to search the web for information which u dont have and talk with real facts rather than hallucinating',
+        schema: z.object({
+            query: z.string().describe('The query to search for'),
+        }),
+    },
+);
+
 const getWeather = tool(
     async ({ city, input }: { city?: string; input?: string }) => {
         const place = (city ?? input)?.trim();
@@ -229,13 +239,22 @@ const getWeather = tool(
     },
 );
 
-const getWeatherForLocation = async (latitude: number, longitude: number) => {
-    const response = await fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true`,
-    );
-    const data = await response.json();
-    return data;
-};
+const approveGate = tool(
+    async ({ approve }: { approve: boolean }) => {
+        return {
+            approve,
+        };
+    },
+    {
+        name: 'approve_gate',
+        description: 'Use this tool to approve or reject the next tool call',
+        schema: z.object({
+            approve: z
+                .boolean()
+                .describe('Whether to approve the next tool call'),
+        }),
+    },
+);
 
 // State schema for the chatbot
 const State = new StateSchema({
@@ -243,9 +262,9 @@ const State = new StateSchema({
 });
 
 const model = new ChatOllama({
-    model: 'glm-5.2:cloud',
+    model: 'glm-5.3:cloud',
     baseUrl: 'https://ollama.com',
-    temperature: 0.7,
+    temperature: 0.5,
     headers: {
         Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
     },
@@ -253,7 +272,7 @@ const model = new ChatOllama({
 
 const chatbot: GraphNode<typeof State> = async (state) => {
     const response = await model
-        .bindTools([searchTool, getWeather])
+        .bindTools([searchTool, getWeather, approveGate])
         .invoke(state.messages, { outputVersion: 'v1' });
 
     // Append the model message as-is so tool_calls survive for ToolNode routing.
@@ -268,14 +287,16 @@ function routeAfterChatbot(state: typeof State.State) {
     return END;
 }
 
-const toolNode = new ToolNode([searchTool, getWeather]);
+const toolNode = new ToolNode([searchTool, getWeather, approveGate]);
 
 export const graph = new StateGraph(State)
     .addNode('chatbot', chatbot)
+    .addNode('approve_gate', approveGate)
     .addNode('tool_call', toolNode)
     .addEdge(START, 'chatbot')
     .addConditionalEdges('chatbot', routeAfterChatbot, ['tool_call', END])
     .addEdge('tool_call', 'chatbot')
-    .compile({ checkpointer, store });
+    .addEdge('approve_gate', 'tool_call')
+    .compile({ checkpointer, store, interruptBefore: ['tool_call'] });
 
 export type ChatPipeline = typeof graph;
