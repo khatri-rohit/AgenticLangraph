@@ -1,5 +1,6 @@
 import { toBaseMessages, toUIMessageStream } from '@ai-sdk/langchain';
 import { createUIMessageStreamResponse, type UIMessage } from 'ai';
+import { HumanMessage } from '@langchain/core/messages';
 import { graph } from '@/graph/v2/chatpipline';
 import { Command } from '@langchain/langgraph';
 import {
@@ -51,7 +52,6 @@ export async function POST(req: Request) {
         // Resume: same `thread_id` as the run that hit interrupt(); input is only Command(resume).
         // @see https://docs.langchain.com/oss/javascript/langgraph/interrupts#resuming-interrupts
 
-        console.log('approval', approval);
         if (approval) {
             const stream = await graph.stream(
                 new Command({ resume: approval }),
@@ -71,9 +71,17 @@ export async function POST(req: Request) {
         }
 
         const langchainMessages = await toBaseMessages(messages as UIMessage[]);
+        const incoming = langchainMessages.at(-1);
+        if (!incoming || !HumanMessage.isInstance(incoming)) {
+            return Response.json(
+                { error: 'messages must end with a user turn' },
+                { status: 400 },
+            );
+        }
 
+        // Checkpointer already holds prior turns; MessagesValue appends.
         const stream = await graph.stream(
-            { messages: langchainMessages },
+            { messages: [incoming] },
             streamOptions,
         );
 

@@ -15,9 +15,13 @@ export type ToolApprovalDecision =
     | { action: 'deny'; reason?: string; toolCallId: string };
 
 export const ToolApprovalDecisionSchema = z.discriminatedUnion('action', [
-    z.object({ action: z.literal('approve') }),
+    z.object({
+        action: z.literal('approve'),
+        toolCallId: z.string().min(1),
+    }),
     z.object({
         action: z.literal('deny'),
+        toolCallId: z.string().min(1),
         reason: z.string().optional(),
     }),
 ]);
@@ -26,7 +30,8 @@ export const ToolApprovalDecisionSchema = z.discriminatedUnion('action', [
 export const ChatV2PostBodySchema = z.object({
     messages: z.array(z.unknown()).optional(),
     threadId: z.string().min(1).optional(),
-    approval: z.array(ToolApprovalDecisionSchema).optional(),
+    /** One decision per resume; sequential HITL uses one HTTP round-trip per tool. */
+    approval: ToolApprovalDecisionSchema.optional(),
     requireToolApproval: z.boolean().optional(),
     enabledTools: z.array(z.string()).optional(),
     autoApproveTools: z.array(z.string()).optional(),
@@ -69,15 +74,26 @@ export function isToolDenialContent(content: unknown): boolean {
     return String(content).startsWith(TOOL_DENIAL_PREFIX);
 }
 
-/** Payload surfaced to the client while the graph is paused at human_approval. */
-export type ToolApprovalInterruptPayload = {
-    kind: 'tool_approval';
-    toolCalls: Array<{
-        id?: string;
-        name: string;
-        args: Record<string, unknown>;
-    }>;
+type ToolCallPayload = {
+    id?: string;
+    name: string;
+    args: Record<string, unknown>;
 };
+
+/** `actionRequests` is required by `@ai-sdk/langchain` `toUIMessageStream` HITL mapping. */
+export type ToolApprovalInterruptPayload =
+    | {
+          kind: 'tool_approval';
+          mode: 'sequential';
+          toolCall: ToolCallPayload;
+          actionRequests: ToolCallPayload[];
+      }
+    | {
+          kind: 'tool_approval';
+          mode: 'batch';
+          toolCalls: ToolCallPayload[];
+          actionRequests: ToolCallPayload[];
+      };
 
 /** Runtime flags from the client (see POST /api/chat/v2). */
 export type HitlConfigurable = {

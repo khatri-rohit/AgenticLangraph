@@ -5,21 +5,18 @@ import {
     GraphNode,
     StateSchema,
     MessagesValue,
-    interrupt,
     getConfig,
 } from '@langchain/langgraph';
-import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
-import type {
-    ToolApprovalDecision,
-    ToolApprovalInterruptPayload,
-    HitlConfigurable,
-} from '@/lib/hitl';
+import type { HitlConfigurable } from '@/lib/hitl';
+import { isToolDenialContent } from '@/lib/hitl';
 import {
-    TOOL_DENIAL_PREFIX,
-    isToolDenialContent,
-} from '@/lib/hitl';
+    HITL_APPROVAL_MODE,
+    executeToolCall,
+    getPendingToolCalls,
+    interruptSequentialTool,
+} from '@/graph/v2/hitl-approval';
 import z from 'zod';
 import { ChatOllama } from '@langchain/ollama';
 import { MemorySaver } from '@langchain/langgraph';
@@ -261,7 +258,7 @@ const State = new StateSchema({
 });
 
 const model = new ChatOllama({
-    model: 'glm-5.3:cloud',
+    model: 'glm-5.2:cloud',
     baseUrl: 'https://ollama.com',
     temperature: 0.5,
     headers: {
@@ -277,7 +274,7 @@ const chatbot: GraphNode<typeof State> = async (state) => {
         .bindTools(boundTools)
         .invoke(state.messages, { outputVersion: 'v1' });
 
-    // Append the model message as-is so tool_calls survive for ToolNode routing.
+    // Keep tool_calls on the AI message so routing and tool_call can read them.
     return { messages: [response] };
 };
 
@@ -290,92 +287,86 @@ function routeAfterChatbot(state: typeof State.State) {
 }
 
 /**
- * Pauses the run for human approve/deny when policy requires it.
- * Resume with Command({ resume: ToolApprovalDecision }) from the API.
+ * One interrupt per visit for the next pending tool. Side effects live in `tool_call`.
+ * HITL off / auto-approved tools skip interrupt and fall through to `tool_call`.
  */
 const humanApproval: GraphNode<typeof State> = async (state) => {
+    const pending = getPendingToolCalls(state.messages);
+    console.log('pending', pending);
+    if (pending.length === 0) return {};
+
     const hitl = readHitlConfig();
-    const last = state.messages.at(-1);
-    if (!AIMessage.isInstance(last) || !last.tool_calls?.length) {
-        return {};
-    }
+    if (!hitl.require_tool_approval) return {};
 
-    const toolCalls = last.tool_calls;
+    const next = pending[0];
     const autoApprove = new Set(hitl.auto_approve_tools ?? []);
-    const needsInterrupt =
-        hitl.require_tool_approval === true &&
-        toolCalls.some((tc) => !autoApprove.has(tc.name));
+    if (autoApprove.has(next.name)) return {};
 
-    // Auto-run: no interrupt; routing continues to tool_call.
-    if (!needsInterrupt) {
-        return {};
-    }
-
-    // First visit: interrupt with pending tool metadata for the UI.
-    // Second visit (after Command resume): `decision` is the user's choice.
-    const decision = interrupt<
-        ToolApprovalInterruptPayload,
-        ToolApprovalDecision
-    >({
-        kind: 'tool_approval',
-        toolCalls: toolCalls.map((tc) => ({
-            id: tc.id,
-            name: tc.name,
-            args: tc.args as Record<string, unknown>,
-        })),
-    });
-
-    if (decision.action === 'deny') {
-        const reason =
-            decision.reason?.trim() || 'User denied tool execution.';
-        const denialMessages = toolCalls.map(
-            (tc) =>
-                new ToolMessage({
-                    content: `${TOOL_DENIAL_PREFIX} ${reason}`,
-                    tool_call_id: tc.id ?? '',
-                    name: tc.name,
-                }),
-        );
-        return { messages: denialMessages };
-    }
-
-    // Approved: proceed to ToolNode with unchanged AI tool_calls in state.
-    return {};
+    return interruptSequentialTool(next);
 };
 
 function routeAfterHumanApproval(state: typeof State.State) {
+    const pending = getPendingToolCalls(state.messages);
+    if (pending.length === 0) return 'chatbot';
+
     const last = state.messages.at(-1);
     if (ToolMessage.isInstance(last) && isToolDenialContent(last.content)) {
-        return 'chatbot';
+        return 'human_approval';
     }
+
     return 'tool_call';
 }
 
-const toolNode = new ToolNode(ALL_AGENT_TOOLS);
+const runTools: GraphNode<typeof State> = async (state) => {
+    const pending = getPendingToolCalls(state.messages);
+    if (pending.length === 0) return {};
+
+    const hitl = readHitlConfig();
+    const toolsByName = new Map(
+        toolsForRun(hitl).map((t) => [t.name, t] as const),
+    );
+    const autoApprove = new Set(hitl.auto_approve_tools ?? []);
+    const oneAtATime =
+        HITL_APPROVAL_MODE === 'sequential' &&
+        hitl.require_tool_approval === true &&
+        pending.some((tc) => !autoApprove.has(tc.name));
+
+    const toRun = oneAtATime ? pending.slice(0, 1) : pending;
+    const messages: ToolMessage[] = [];
+    for (const tc of toRun) {
+        messages.push(await executeToolCall(tc, toolsByName));
+    }
+    return { messages };
+};
+
+function routeAfterTools(state: typeof State.State) {
+    return getPendingToolCalls(state.messages).length > 0
+        ? 'human_approval'
+        : 'chatbot';
+}
 
 /**
- * Graph flow (human-in-the-loop):
- *   START → chatbot → (tool calls?) → human_approval → tool_call → chatbot → END
+ * Sequential HITL (active):
+ *   chatbot → human_approval (interrupt next tool) → tool_call (run that tool)
+ *           → human_approval | chatbot
  *
- * - `human_approval` calls interrupt() when require_tool_approval is true and the
- *   tool is not listed in auto_approve_tools (from config.configurable).
- * - Resume with Command({ resume: { action: 'approve' | 'deny' } }) via POST /api/chat/v2.
- * - Deny injects ToolMessages so the model can respond without running ToolNode.
+ * HITL off: human_approval is a no-op; tool_call runs the full pending batch.
  */
 export const graph = new StateGraph(State)
     .addNode('chatbot', chatbot)
     .addNode('human_approval', humanApproval)
-    .addNode('tool_call', toolNode)
+    .addNode('tool_call', runTools)
     .addEdge(START, 'chatbot')
-    .addConditionalEdges('chatbot', routeAfterChatbot, [
-        'human_approval',
-        END,
-    ])
+    .addConditionalEdges('chatbot', routeAfterChatbot, ['human_approval', END])
     .addConditionalEdges('human_approval', routeAfterHumanApproval, [
         'tool_call',
+        'human_approval',
         'chatbot',
     ])
-    .addEdge('tool_call', 'chatbot')
+    .addConditionalEdges('tool_call', routeAfterTools, [
+        'human_approval',
+        'chatbot',
+    ])
     .compile({ checkpointer });
 
 export type ChatPipeline = typeof graph;
